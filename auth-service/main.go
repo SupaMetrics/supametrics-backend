@@ -11,7 +11,7 @@ import (
 
 func main() {
 	app := gin.Default()
-	app.SetTrustedProxies(nil)
+	app.SetTrustedProxies([]string{"0.0.0.0/0"})
 
 	err := godotenv.Load()
 	if err != nil {
@@ -19,6 +19,7 @@ func main() {
 	}
 
 	app.GET("/", func(ctx *gin.Context) {
+		log.Println(ctx.ClientIP())
 		ctx.JSON(200, gin.H{
 			"success": true, "message": "connected!",
 		})

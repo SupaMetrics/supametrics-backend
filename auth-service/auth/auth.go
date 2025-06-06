@@ -1,66 +1,66 @@
 package auth
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"main/controllers"
+	"main/db"
 	"main/encrypt"
+	"main/structs"
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
-type Payload struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	FullName string `json:"fullName"`
-}
-
-type StoredUser struct {
-	EncryptedData string
-	PasswordHash  string
-}
-
-var dummyDB = make(map[string]StoredUser)
-
 func HandleSignUp(ctx *gin.Context) {
 	key := os.Getenv("RAND_IV")
-	var data Payload
+	var data structs.Payload
+
+	log.Println(ctx.ClientIP(), ctx.RemoteIP())
 
 	if err := ctx.BindJSON(&data); err != nil {
 		ctx.JSON(400, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 
-	if data.Email == "" || data.FullName == "" || data.Password == "" {
-		ctx.JSON(400, gin.H{"success": false, "message": "All fields must be filled"})
+	if err := data.ValidateFields(); err != nil {
+		ctx.JSON(400, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 
-	if _, exists := dummyDB[data.Email]; exists {
-		ctx.JSON(400, gin.H{"success": false, "message": "User already exists"})
-		return
-	}
+	client := db.GetClient()
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(data.Password), bcrypt.DefaultCost)
+	userEmail, err := encrypt.EncryptDataStaticIV(data.Email, key)
 	if err != nil {
-		ctx.JSON(500, gin.H{"success": false, "message": "Could not hash password"})
+		log.Println("Error encrypting user email: ", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
-	encData, err := encryptPayload(Payload{FullName: data.FullName, Email: data.Email}, key)
+	var userExists bool
+
+	err = client.QueryRow(ctx.Request.Context(), "SELECT EXISTS (SELECT 1  FROM users WHERE email = $1)", userEmail).Scan(&userExists)
 	if err != nil {
-		ctx.JSON(500, gin.H{"success": false, "message": "Could not encrypt data"})
+		log.Println("DB error:", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
-	dummyDB[data.Email] = StoredUser{
-		EncryptedData: encData,
-		PasswordHash:  string(hash),
+	if userExists {
+		log.Println("Email already exists")
+		ctx.JSON(400, gin.H{"success": false, "message": "Email already exists, try signin in"})
+		return
 	}
 
-	log.Println(dummyDB)
+	payload := structs.Payload{FullName: data.FullName, Email: data.Email, Password: data.Password}
+
+	err = controllers.CreateUserController(payload, ctx.ClientIP(), client, ctx.GetHeader("User-Agent"))
+	if err != nil {
+		log.Println("Error creating user: ", err.Error())
+	}
 
 	ctx.JSON(201, gin.H{
 		"success": true,
@@ -70,7 +70,8 @@ func HandleSignUp(ctx *gin.Context) {
 
 func HandleSignin(ctx *gin.Context) {
 	key := os.Getenv("RAND_IV")
-	var data Payload
+	var data structs.Payload
+	client := db.GetClient()
 
 	if err := ctx.BindJSON(&data); err != nil {
 		ctx.JSON(400, gin.H{"success": false, "message": err.Error()})
@@ -82,20 +83,38 @@ func HandleSignin(ctx *gin.Context) {
 		return
 	}
 
-	storedUser, exists := dummyDB[data.Email]
-	if !exists {
-		ctx.JSON(404, gin.H{"success": false, "message": "User not found"})
+	encryptedEmail, err := encrypt.EncryptDataStaticIV(data.Email, key)
+	if err != nil {
+		log.Println("Error encrypting user email: ", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(storedUser.PasswordHash), []byte(data.Password)); err != nil {
+	var user db.DbData
+
+	err = client.QueryRow(ctx.Request.Context(), "SELECT uuid, full_name, email, password  FROM users WHERE email = $1", encryptedEmail).Scan(
+		&user.UUID,
+		&user.Full_Name,
+		&user.Email,
+		&user.Password,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		ctx.JSON(404, gin.H{"success": false, "message": "User not found"})
+		return
+	} else if err != nil {
+		log.Println("DB error:", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
+		return
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(data.Password)); err != nil {
 		ctx.JSON(400, gin.H{"success": false, "message": "Incorrect password"})
 		return
 	}
 
-	decData, err := decryptPayload(storedUser.EncryptedData, key)
+	decData, err := structs.Payload{Email: user.Email, FullName: user.Full_Name}.DecryptPayload(key)
 	if err != nil {
-		ctx.JSON(500, gin.H{"success": false, "message": "Could not decrypt user data"})
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
@@ -107,47 +126,56 @@ func HandleSignin(ctx *gin.Context) {
 
 func HandleOauth(ctx *gin.Context) {
 	key := os.Getenv("RAND_IV")
-	var data Payload
+	var data structs.Payload
+
+	client := db.GetClient()
 
 	if err := ctx.BindJSON(&data); err != nil {
 		ctx.JSON(400, gin.H{"success": false, "message": err.Error()})
 		return
 	}
 
-	if stored, exists := dummyDB[data.Email]; exists {
-		user, _ := decryptPayload(stored.EncryptedData, key)
-		ctx.JSON(200, gin.H{"success": true, "message": "Welcome back " + user.FullName})
+	encryptedEmail, err := encrypt.EncryptDataStaticIV(data.Email, key)
+	if err != nil {
+		log.Println("Error encrypting user email: ", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
-	encData, err := encryptPayload(Payload{FullName: data.FullName, Email: data.Email}, key)
-	if err != nil {
-		ctx.JSON(500, gin.H{"success": false, "message": "Encryption failed"})
+	var user db.DbData
+
+	err = client.QueryRow(ctx.Request.Context(), "SELECT uuid, full_name, email, password  FROM users WHERE email = $1", encryptedEmail).Scan(
+		&user.UUID,
+		&user.Full_Name,
+		&user.Email,
+		&user.Password,
+	)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = controllers.CreateUserController(data, ctx.ClientIP(), client, ctx.GetHeader("User-Agent"))
+		if err != nil {
+			log.Println("Error creating user: ", err.Error())
+		}
+
+		ctx.JSON(201, gin.H{
+			"success": true,
+			"message": fmt.Sprintf("User created successfully, welcome onboard %s", data.FullName),
+		})
+		return
+	} else if err != nil {
+		log.Println("DB error:", err)
+		ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
 		return
 	}
 
-	dummyDB[data.Email] = StoredUser{
-		EncryptedData: encData,
-		PasswordHash:  "",
-	}
+	// decryptedData, err := structs.Payload{FullName: user.Full_Name, Email: user.Email}.DecryptPayload(key)
+	// if err != nil {
+	// 	log.Println("Error decrypting data")
+	// 	ctx.JSON(500, gin.H{"success": false, "message": "Internal error"})
+	// 	return
+	// }
 
-	ctx.JSON(201, gin.H{"success": true, "message": "Welcome onboard " + data.FullName})
-}
+	resUser := structs.ResUser{FullName: data.FullName, UUID: user.UUID}
 
-func encryptPayload(data Payload, key string) (string, error) {
-	plainBytes, err := json.Marshal(data)
-	if err != nil {
-		return "", err
-	}
-	return encrypt.EncryptDataRandomIV(string(plainBytes), key)
-}
-
-func decryptPayload(encrypted, key string) (Payload, error) {
-	var result Payload
-	dec, err := encrypt.DecryptDataRandomIV(encrypted, key)
-	if err != nil {
-		return result, err
-	}
-	err = json.Unmarshal([]byte(dec), &result)
-	return result, err
+	ctx.JSON(201, gin.H{"success": true, "message": "Welcome onboard " + data.FullName, "user": resUser})
 }
