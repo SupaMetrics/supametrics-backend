@@ -31,5 +31,5 @@ func main() {
 	auths.POST("/oauth", auth.HandleOauth)
 
 	log.Println("Server running on port 8080")
-	app.Run("localhost:8080")
+	app.Run(":8080")
 }
