@@ -1,7 +1,6 @@
-# ** Supermetrics: Privacy-First Lightweight Opensource Analytics **
+# Supermetrics: Open-source analytics that put *\*you*\* in control
 
-Supametrics is a cutting-edge analytics platform that provides a unified, real-time view of website and app performance, empowering businesses to uncover hidden trends, optimize user experience, and drive data-driven decisions to fuel growth.
-
+A lightweight, privacy-first alternative to Google Analytics — built for self-hosting, GDPR compliance, and full data ownership. No cookies, less than 5kb, just insights.
 
 ## Contributing
 
